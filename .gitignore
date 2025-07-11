@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .vscode/
 .DS_Store
+시장가주문.py
+잔고조회.py
+연습코드.py

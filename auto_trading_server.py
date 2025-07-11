@@ -28,6 +28,11 @@ trade_status = {
     "error": None
 }
 
+@app.route('/')
+def home():
+    return "골든타임 자동매매 서버가 정상 실행 중입니다."
+
+
 # 4. 잔고조회
 def get_balance(coin="USDT"):
     try:
@@ -172,4 +177,28 @@ def trade_worker(
             if stop_loss is not None and cur_price is not None:
                 if (position_type == "long" and cur_price <= stop_loss) or \
                    (position_type == "short" and cur_price >= stop_loss):
-                    exit_order = close_posi
+                    exit_order = close_position(symbol, side, qty)
+                    trade_status['info']['exit_order'] = exit_order
+                    trade_status['info']['exit_price'] = cur_price
+                    trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    exit_fired = True
+                    break
+
+            # 종료시간 도달시 자동 청산
+            if now >= exit_dt:
+                exit_order = close_position(symbol, side, qty)
+                trade_status['info']['exit_order'] = exit_order
+                trade_status['info']['exit_price'] = cur_price
+                trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
+                exit_fired = True
+                break
+
+            time.sleep(1)
+
+    except Exception as e:
+        trade_status['error'] = str(e)
+    finally:
+        trade_status['running'] = False
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)

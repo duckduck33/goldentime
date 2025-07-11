@@ -1,0 +1,8 @@
+/project_root
+│
+├── trade_worker.py         # 1단계: 자동매매(TradeWorker) 쓰레드 및 매매 로직
+├── api_server.py           # 2단계: Flask API 서버 및 라우팅 구현
+├── utils.py                # 공통 함수 및 유틸리티 함수들 (선택사항)
+├── requirements.txt
+├── .env
+└── ...
