@@ -1,0 +1,27 @@
+# 1. 원하는 폴더로 이동 (예: D:\baekeok_project\goldentime_auto)
+cd D:\baekeok_project\goldentime_auto
+
+# 2. 가상환경 생성 (env라는 이름으로 생성)
+python -m venv env
+
+# 3. 가상환경 활성화 (윈도우)
+env\Scripts\activate
+
+-----------최초 설치시만 필요----------------------
+# 4. pip 최신화(선택)
+pip install --upgrade pip
+
+# 5. 프로젝트 requirements.txt 패키지 먼저 설치 (서버, 매매 관련)
+pip install -r requirements.txt
+
+# 6. 스트리밋 프론트 추가 설치
+pip install streamlit requests
+
+------------------------------------
+
+# 7. 새로운 터미널/명령프롬프트(또는 탭)에서
+# 가상환경 다시 활성화 후, 아래 명령 실행
+python api_server.py
+
+# 8. 또 다른 터미널(또는 탭)에서, 가상환경 활성화 후
+streamlit run streamlit_front.py
