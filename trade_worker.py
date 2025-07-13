@@ -7,27 +7,24 @@ from datetime import datetime
 from pybit.unified_trading import HTTP
 import threading
 
-# 환경변수 읽기
+from stop_loss_calc import get_long_stop_loss, get_short_stop_loss
+
 BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
 
-# 바이비트 테스트넷 세션
 session = HTTP(
     testnet=True,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET
 )
 
-# 매매 상태 전역 변수 (단일 스레드 기준)
 trade_status = {
     "running": False,
     "info": {},
     "error": None
 }
 
-# 함수 정의들 (잔고조회, 현재가, 주문, 청산)
-
-def get_balance(coin="USDT"):
+def get_balance(coin: str = "USDT"):
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin)
         return res['result']['list'][0]['totalEquity']
@@ -69,22 +66,97 @@ def close_position(symbol, side, qty):
         return res
     except Exception as e:
         return f"청산실패: {e}"
-# 8. while True로 예약매매 + 조건 체크 (업계 실전 패턴)
+
+def get_tick_size(symbol, session):
+    try:
+        res = session.get_instruments_info(category="linear", symbol=symbol)
+        tick_size = float(res['result']['list'][0]['priceFilter']['tickSize'])
+        return tick_size
+    except Exception as e:
+        print("틱사이즈 조회 실패:", e)
+        return 1.0
+
+def get_recent_lows(symbol, session, interval="15"):
+    try:
+        res = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            limit=6
+        )
+        klines = res['result']['list']
+        klines = sorted(klines, key=lambda x: int(x[0]))
+        lows = [float(k[3]) for k in klines[:-1]]
+        return lows
+    except Exception as e:
+        print("OHLCV(캔들) 조회 실패:", e)
+        return []
+
+def get_recent_highs(symbol, session, interval="15"):
+    try:
+        res = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            limit=6
+        )
+        klines = res['result']['list']
+        klines = sorted(klines, key=lambda x: int(x[0]))
+        highs = [float(k[2]) for k in klines[:-1]]
+        return highs
+    except Exception as e:
+        print("OHLCV(캔들) 조회 실패:", e)
+        return []
+
+def place_trigger_order(symbol, side, qty, trigger_price, direction):
+    try:
+        res = session.place_conditional_order(
+            category="linear",
+            symbol=symbol,
+            side=side,
+            orderType="Market",
+            qty=qty,
+            triggerDirection=direction,
+            triggerPrice=trigger_price,
+            reduceOnly=True
+        )
+        return res
+    except Exception as e:
+        print(f"트리거주문 실패: {e}")
+        return None
+
+def cancel_conditional_order(symbol, order_id):
+    try:
+        res = session.cancel_conditional_order(
+            category="linear",
+            symbol=symbol,
+            orderId=order_id
+        )
+        return res
+    except Exception as e:
+        print(f"조건부 주문 취소 실패: {e}")
+        return None
+
+def get_conditional_order_status(symbol, order_id):
+    try:
+        res = session.get_conditional_orders(
+            category="linear",
+            symbol=symbol,
+            orderId=order_id
+        )
+        if res['result']['list']:
+            order_info = res['result']['list'][0]
+            return order_info.get('orderStatus')
+        else:
+            return None
+    except Exception as e:
+        print("조건부 주문 조회 실패:", e)
+        return None
+
 def trade_worker(
     position_type, symbol, qty, entry_time, exit_time,
-    entry_price_cond=None, take_profit=None, stop_loss=None
+    take_profit=None, stop_loss=None
 ):
-    """
-    - position_type: 'long' 또는 'short'
-    - symbol: 예) 'BTCUSDT'
-    - qty: 주문수량
-    - entry_time: 예약진입시간 (str, "YYYY-MM-DD HH:MM")
-    - exit_time: 예약종료시간 (str, "YYYY-MM-DD HH:MM")
-    - entry_price_cond: 예약 진입가격(조건), None이면 시간만 대기
-    - take_profit: 익절가격, None이면 미적용
-    - stop_loss: 손절가격, None이면 미적용
-    """
-
     trade_status['running'] = True
     trade_status['info'] = {
         "position_type": position_type,
@@ -92,115 +164,178 @@ def trade_worker(
         "qty": qty,
         "entry_time": entry_time,
         "exit_time": exit_time,
-        "entry_price_cond": entry_price_cond,
         "take_profit": take_profit,
         "stop_loss": stop_loss,
         "entry_price": None,
         "exit_price": None,
         "entry_order": None,
-        "exit_order": None,
+        "tp_order": None,
+        "sl_order": None,
+        "tp_order_id": None,
+        "sl_order_id": None,
         "entry_at": None,
-        "exit_at": None
+        "tp_price": None,
+        "sl_price": None,
+        "stop_loss_msg": None
     }
-
     try:
-        # 1. 진입 전까지 while True로 실시간 대기/체크
         entry_dt = datetime.strptime(entry_time, "%Y-%m-%d %H:%M")
+        exit_dt = datetime.strptime(exit_time, "%Y-%m-%d %H:%M")
         entry_fired = False
 
         while not entry_fired:
-            #  중단 요청이 들어왔는지 확인
             if not trade_status["running"]:
                 break
             now = datetime.now()
-            cur_price = get_price(symbol)
-
-            # 1) 진입 예약시간 도달 시 진입
             if now >= entry_dt:
-                if entry_price_cond is None or (cur_price is not None and (
-                    (position_type == "long" and cur_price <= entry_price_cond) or
-                    (position_type == "short" and cur_price >= entry_price_cond)
-                )):
-                    # 진입조건(시간+가격) 만족하면 진입
-                    side = "Buy" if position_type == "long" else "Sell"
-                    entry_order = open_position(symbol, side, qty)
-                    trade_status['info']['entry_order'] = entry_order
-                    trade_status['info']['entry_price'] = cur_price
-                    trade_status['info']['entry_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    entry_fired = True
-                    break
+                side = "Buy" if position_type == "long" else "Sell"
+                entry_order = open_position(symbol, side, qty)
+                trade_status['info']['entry_order'] = entry_order
+                trade_status['info']['entry_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            # 2) 진입 예약시간 전, 가격조건이 있다면 조건 달성시 바로 진입
-            if entry_price_cond is not None and cur_price is not None:
-                if (position_type == "long" and cur_price <= entry_price_cond) or \
-                   (position_type == "short" and cur_price >= entry_price_cond):
-                    side = "Buy" if position_type == "long" else "Sell"
-                    entry_order = open_position(symbol, side, qty)
-                    trade_status['info']['entry_order'] = entry_order
-                    trade_status['info']['entry_price'] = cur_price
-                    trade_status['info']['entry_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    entry_fired = True
-                    break
+                executed_price = None
+                if isinstance(entry_order, dict) and 'result' in entry_order:
+                    executed_price = entry_order['result'].get('avgPrice')
+                    if executed_price is None:
+                        executed_price = entry_order['result'].get('price')
+                    if executed_price is not None:
+                        executed_price = float(executed_price)
+                if executed_price is None:
+                    executed_price = get_price(symbol)
+                trade_status['info']['entry_price'] = executed_price
 
-            # 3) 1초마다 반복 체크
+                tick_size = get_tick_size(symbol, session)
+                interval = "15"
+                if stop_loss is None:
+                    if position_type == "long":
+                        lows = get_recent_lows(symbol, session, interval=interval)
+                        stop_loss, stop_msg, stop_pct = get_long_stop_loss(
+                            lows=lows,
+                            entry_price=executed_price,
+                            tick_size=tick_size,
+                            tick_offset=5,
+                            fallback_pct=0.01
+                        )
+                        loss_gap = executed_price - stop_loss
+                        take_profit = round(executed_price + loss_gap * 2, 8)
+                        trade_status['info']['tp_price'] = take_profit
+                    else:
+                        highs = get_recent_highs(symbol, session, interval=interval)
+                        stop_loss, stop_msg, stop_pct = get_short_stop_loss(
+                            highs=highs,
+                            entry_price=executed_price,
+                            tick_size=tick_size,
+                            tick_offset=5,
+                            fallback_pct=0.01
+                        )
+                        loss_gap = stop_loss - executed_price
+                        take_profit = round(executed_price - loss_gap * 2, 8)
+                        trade_status['info']['tp_price'] = take_profit
+                    print(stop_msg)
+                    trade_status['info']['stop_loss'] = stop_loss
+                    trade_status['info']['stop_loss_msg'] = stop_msg
+                else:
+                    stop_msg = f"사용자 지정 손절값({stop_loss})이 적용됩니다."
+                    trade_status['info']['stop_loss_msg'] = stop_msg
+                    if take_profit is None:
+                        if position_type == "long":
+                            loss_gap = executed_price - stop_loss
+                            take_profit = round(executed_price + loss_gap * 2, 8)
+                            trade_status['info']['tp_price'] = take_profit
+                        else:
+                            loss_gap = stop_loss - executed_price
+                            take_profit = round(executed_price - loss_gap * 2, 8)
+                            trade_status['info']['tp_price'] = take_profit
+
+                if position_type == "long":
+                    tp_direction = 1
+                    sl_direction = 2
+                    close_side = "Sell"
+                else:
+                    tp_direction = 2
+                    sl_direction = 1
+                    close_side = "Buy"
+
+                tp_order, sl_order = None, None
+                tp_order_id, sl_order_id = None, None
+                if take_profit is not None:
+                    tp_order = place_trigger_order(
+                        symbol, close_side, qty, take_profit, tp_direction
+                    )
+                    if tp_order and 'result' in tp_order:
+                        tp_order_id = tp_order['result'].get('orderId')
+                        trade_status['info']['tp_order_id'] = tp_order_id
+                    trade_status['info']['tp_order'] = tp_order
+                    trade_status['info']['tp_price'] = take_profit
+                if stop_loss is not None:
+                    sl_order = place_trigger_order(
+                        symbol, close_side, qty, stop_loss, sl_direction
+                    )
+                    if sl_order and 'result' in sl_order:
+                        sl_order_id = sl_order['result'].get('orderId')
+                        trade_status['info']['sl_order_id'] = sl_order_id
+                    trade_status['info']['sl_order'] = sl_order
+                    trade_status['info']['sl_price'] = stop_loss
+
+                entry_fired = True
+                print(f"[트리거주문 등록완료] 익절: {take_profit}, 손절: {stop_loss}")
+                break
             time.sleep(1)
 
-        # 2. 진입 이후, 익절/손절/종료시간까지 실시간 감시
-        exit_dt = datetime.strptime(exit_time, "%Y-%m-%d %H:%M")
-        side = "Buy" if position_type == "long" else "Sell"
-        exit_fired = False
+        tp_filled = False
+        sl_filled = False
+        close_fired = False
+        symbol = trade_status['info']['symbol']
+        tp_order_id = trade_status['info'].get('tp_order_id')
+        sl_order_id = trade_status['info'].get('sl_order_id')
 
-        while not exit_fired:
-             #  중단 요청이 들어왔는지 확인
-            if not trade_status["running"]:
-                break
-            
+        while trade_status['running']:
             now = datetime.now()
-            cur_price = get_price(symbol)
 
-            # 익절(수익실현) 조건 도달
-            if take_profit is not None and cur_price is not None:
-                if (position_type == "long" and cur_price >= take_profit) or \
-                   (position_type == "short" and cur_price <= take_profit):
-                    exit_order = close_position(symbol, side, qty)
-                    trade_status['info']['exit_order'] = exit_order
-                    trade_status['info']['exit_price'] = cur_price
-                    trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    exit_fired = True
-                    break
-
-            # 손절(손실컷) 조건 도달
-            if stop_loss is not None and cur_price is not None:
-                if (position_type == "long" and cur_price <= stop_loss) or \
-                   (position_type == "short" and cur_price >= stop_loss):
-                    exit_order = close_position(symbol, side, qty)
-                    trade_status['info']['exit_order'] = exit_order
-                    trade_status['info']['exit_price'] = cur_price
-                    trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    exit_fired = True
-                    break
-
-            # 종료시간 도달시 자동 청산
-            if now >= exit_dt:
-                exit_order = close_position(symbol, side, qty)
-                trade_status['info']['exit_order'] = exit_order
-                trade_status['info']['exit_price'] = cur_price
+            if now >= exit_dt and not close_fired:
+                side = "Buy" if position_type == "long" else "Sell"
+                close_order = close_position(symbol, side, qty)
+                trade_status['info']['exit_order'] = close_order
+                trade_status['info']['exit_price'] = get_price(symbol)
                 trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                exit_fired = True
+                if tp_order_id:
+                    cancel_conditional_order(symbol, tp_order_id)
+                    print("[알림] 남은 익절 트리거주문 자동취소됨.")
+                if sl_order_id:
+                    cancel_conditional_order(symbol, sl_order_id)
+                    print("[알림] 남은 손절 트리거주문 자동취소됨.")
+                print("[포지션 청산] 매도시간 도달하여 포지션을 종료했습니다.")
+                close_fired = True
                 break
 
-            time.sleep(1)
+            if tp_order_id and not tp_filled:
+                tp_status = get_conditional_order_status(symbol, tp_order_id)
+                if tp_status == "Filled":
+                    print("[체결] 익절주문이 체결되었습니다.")
+                    tp_filled = True
+                    if sl_order_id:
+                        cancel_conditional_order(symbol, sl_order_id)
+                        print("[알림] 남은 손절 트리거주문 자동취소됨.")
+                    break
+
+            if sl_order_id and not sl_filled:
+                sl_status = get_conditional_order_status(symbol, sl_order_id)
+                if sl_status == "Filled":
+                    print("[체결] 손절주문이 체결되었습니다.")
+                    sl_filled = True
+                    if tp_order_id:
+                        cancel_conditional_order(symbol, tp_order_id)
+                        print("[알림] 남은 익절 트리거주문 자동취소됨.")
+                    break
+
+            time.sleep(2)
 
     except Exception as e:
         trade_status['error'] = str(e)
     finally:
         trade_status['running'] = False
 
-
 def start_trade_thread(**kwargs):
-    """
-    trade_worker를 새 스레드에서 실행
-    """
     if trade_status["running"]:
         return False, "이미 매매 중입니다."
     th = threading.Thread(target=trade_worker, kwargs=kwargs)

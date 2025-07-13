@@ -39,6 +39,8 @@ def get_recent_lows(symbol, session, interval="15"):
         print("OHLCV(캔들) 조회 실패:", e)
         return []
 
+
+
 def get_current_price(symbol, session):
     try:
         ticker = session.get_tickers(category="linear", symbol=symbol)
