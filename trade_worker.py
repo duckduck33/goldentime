@@ -10,11 +10,17 @@ import threading
 
 from stop_loss_calc import get_long_stop_loss, get_short_stop_loss
 
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("log.txt", encoding="utf-8"),
+        logging.StreamHandler()  # 터미널에도 동시에 찍고 싶으면 포함
+    ]
 )
+
 
 BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
