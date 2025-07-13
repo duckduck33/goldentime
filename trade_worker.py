@@ -3,6 +3,7 @@ load_dotenv()
 
 import os
 import time
+import math
 import logging
 from datetime import datetime
 from pybit.unified_trading import HTTP
@@ -10,26 +11,26 @@ import threading
 
 from stop_loss_calc import get_long_stop_loss, get_short_stop_loss
 
-
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.FileHandler("log.txt", encoding="utf-8"),
-        logging.StreamHandler()  # 터미널에도 동시에 찍고 싶으면 포함
+        logging.StreamHandler()
     ]
 )
-
 
 BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
 
 session = HTTP(
-    testnet=True,
-    api_key=BYBIT_API_KEY,
+    testnet=False,
+    api_key=BYBIT_API_KEY,   # 실제 API 키 문자열
     api_secret=BYBIT_API_SECRET
 )
+
+
 
 trade_status = {
     "running": False,
@@ -84,7 +85,7 @@ def close_position(symbol, side, qty):
         logging.error(f"청산실패: {e}")
         return f"청산실패: {e}"
 
-def get_tick_size(symbol, session):
+def get_tick_size(symbol):
     try:
         res = session.get_instruments_info(category="linear", symbol=symbol)
         tick_size = float(res['result']['list'][0]['priceFilter']['tickSize'])
@@ -92,6 +93,31 @@ def get_tick_size(symbol, session):
     except Exception as e:
         logging.error(f"틱사이즈 조회 실패: {e}")
         return 1.0
+
+def get_min_qty(symbol):
+    try:
+        res = session.get_instruments_info(category="linear", symbol=symbol)
+        min_qty = float(res['result']['list'][0]['lotSizeFilter']['minOrderQty'])
+        return min_qty
+    except Exception as e:
+        logging.error(f"최소 주문수량 조회 실패: {e}")
+        return 0.001
+
+def get_qty_step(symbol):
+    try:
+        res = session.get_instruments_info(category="linear", symbol=symbol)
+        step = float(res['result']['list'][0]['lotSizeFilter']['qtyStep'])
+        return step
+    except Exception as e:
+        logging.error(f"수량 스텝 조회 실패: {e}")
+        return 0.001
+
+def adjust_qty_by_lot_size(symbol, qty):
+    min_qty = get_min_qty(symbol)
+    step = get_qty_step(symbol)
+    qty = max(qty, min_qty)
+    adjusted_qty = math.floor(qty / step) * step
+    return round(adjusted_qty, 8)
 
 def get_recent_lows(symbol, session, interval="15"):
     try:
@@ -125,14 +151,7 @@ def get_recent_highs(symbol, session, interval="15"):
         logging.error(f"OHLCV(캔들) 조회 실패: {e}")
         return []
 
-def round_qty(qty):
-    """익절 수량을 소수점 4자리로 반올림 (거래소 정책에 맞춤)"""
-    return round(qty, 4)
-
 def get_position_size(symbol):
-    """
-    현재 심볼의 포지션 보유 수량 조회 (없으면 0)
-    """
     try:
         res = session.get_positions(
             category="linear",
@@ -148,11 +167,8 @@ def get_position_size(symbol):
         return 0.0
 
 def place_tp_limit_order(symbol, side, qty, tp_price):
-    """
-    익절(수익실현) 주문을 지정가(리밋)로 절반 수량만 예약
-    """
     close_side = "Sell" if side == "Buy" else "Buy"
-    tp_qty = round(qty / 2, 4)
+    tp_qty = adjust_qty_by_lot_size(symbol, qty / 2)
     try:
         tp_order = session.place_order(
             category="linear",
@@ -165,15 +181,13 @@ def place_tp_limit_order(symbol, side, qty, tp_price):
             timeInForce="GTC"
         )
         logging.info(f"[익절 지정가 주문] 가격: {tp_price}, 수량: {tp_qty}, 결과: {tp_order}")
-        return tp_order
+        tp_order_id = tp_order['result'].get('orderId') if tp_order and 'result' in tp_order and 'orderId' in tp_order['result'] else None
+        return tp_order, tp_order_id
     except Exception as e:
         logging.error(f"익절 지정가 주문 에러: {e}")
-        return None
+        return None, None
 
 def place_stop_loss(symbol, side, sl_price):
-    """
-    손절(Stop Loss) 예약(set_trading_stop) - sl_price를 직접 사용
-    """
     try:
         sl_result = session.set_trading_stop(
             category="linear",
@@ -182,25 +196,39 @@ def place_stop_loss(symbol, side, sl_price):
             slTriggerBy="LastPrice"
         )
         logging.info(f"[손절 예약] 손절가: {sl_price}, 결과: {sl_result}")
-        return sl_result
+        sl_order_id = sl_result['result'].get('orderId') if sl_result and 'result' in sl_result and 'orderId' in sl_result['result'] else None
+        return sl_result, sl_order_id
     except Exception as e:
         logging.error(f"손절 예약 에러: {e}")
-        return None
+        return None, None
+
+def cancel_order(symbol, order_id):
+    if not order_id:
+        return
+    try:
+        res = session.cancel_order(
+            category="linear",
+            symbol=symbol,
+            orderId=order_id
+        )
+        logging.info(f"[주문취소] 주문ID: {order_id}, 결과: {res}")
+    except Exception as e:
+        logging.error(f"[주문취소 에러] {e}")
 
 def trade_worker(
-    position_type, symbol, qty, entry_time, exit_time,
+    position_type, symbol, fixed_loss, entry_time, exit_time,
     take_profit=None, stop_loss=None,
     immediate=False
 ):
     """
-    immediate=True: 진입 시간 조건 무시하고 바로 진입
-    immediate=False: 기존처럼 entry_time, exit_time 사용
+    고정손실액 입력 -> 자동 진입수량 계산(최소수량/틱 자동 보정) -> 주문/감시
+    강제중단 시 포지션 청산 + 예약주문 취소까지 포함
     """
     trade_status['running'] = True
     trade_status['info'] = {
         "position_type": position_type,
         "symbol": symbol,
-        "qty": qty,
+        "fixed_loss": fixed_loss,
         "entry_time": entry_time,
         "exit_time": exit_time,
         "take_profit": take_profit,
@@ -210,6 +238,8 @@ def trade_worker(
         "entry_order": None,
         "tp_order": None,
         "sl_order": None,
+        "tp_order_id": None,
+        "sl_order_id": None,
         "tp_price": None,
         "sl_price": None,
         "stop_loss_msg": None,
@@ -227,88 +257,92 @@ def trade_worker(
             now = datetime.now()
             if immediate or now >= entry_dt:
                 side = "Buy" if position_type == "long" else "Sell"
+
+                # 1) 진입가(현재가) 조회
+                executed_price = get_price(symbol)
+
+                # 2) 손절가 자동계산
+                tick_size = get_tick_size(symbol)
+                interval = "15"
+                tp_ratio = 0.02
+                if position_type == "long":
+                    lows = get_recent_lows(symbol, session, interval=interval)
+                    sl_price, scenario_msg, stop_pct = get_long_stop_loss(
+                        lows=lows,
+                        entry_price=executed_price,
+                        tick_size=tick_size,
+                        tick_offset=5,
+                        fallback_pct=0.01,
+                        take_profit_ratio=tp_ratio
+                    )
+                    logging.info(f"[손절/익절 시나리오]\n{scenario_msg}")
+                else:
+                    highs = get_recent_highs(symbol, session, interval=interval)
+                    sl_price, scenario_msg, stop_pct = get_short_stop_loss(
+                        highs=highs,
+                        entry_price=executed_price,
+                        tick_size=tick_size,
+                        tick_offset=5,
+                        fallback_pct=0.01,
+                        take_profit_ratio=tp_ratio
+                    )
+                    logging.info(f"[손절/익절 시나리오]\n{scenario_msg}")
+
+                # 3) 고정손실액으로 권장 진입수량 계산 & minQty/틱 자동보정
+                loss_amount = float(fixed_loss)
+                raw_qty = loss_amount / abs(executed_price - sl_price)
+                qty = adjust_qty_by_lot_size(symbol, raw_qty)
+                logging.info(f"[고정손실] {loss_amount}$, 진입가:{executed_price}, 손절가:{sl_price} → 권장수량(보정): {qty}")
+
+                # 4) 시장가 진입
                 entry_order = open_position(symbol, side, qty)
                 trade_status['info']['entry_order'] = entry_order
                 trade_status['info']['entry_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-
-                # 진입 체결가 조회 (없으면 현재가로 대체)
-                executed_price = None
-                if isinstance(entry_order, dict) and 'result' in entry_order:
-                    executed_price = entry_order['result'].get('avgPrice')
-                    if executed_price is None:
-                        executed_price = entry_order['result'].get('price')
-                    if executed_price is not None:
-                        executed_price = float(executed_price)
-                if executed_price is None:
-                    executed_price = get_price(symbol)
                 trade_status['info']['entry_price'] = executed_price
 
-                tick_size = get_tick_size(symbol, session)
-                interval = "15"
-                logging.info(f"{symbol} {position_type}포지션 진입가: {executed_price} 입니다")
-
-                # 손절가 분기 (자동/수동 + 안내 메시지)
-                tp_ratio = 0.02   # 익절 비율 (예시: 2%)
-                if stop_loss is not None and stop_loss != "":
-                    sl_price = float(stop_loss)
-                    stop_msg = f"사용자 지정 손절값({sl_price})이 적용됩니다."
-                    tp_price = float(take_profit) if take_profit not in [None, ""] else (
-                        round(executed_price * (1 + tp_ratio), 8) if position_type == "long" else round(executed_price * (1 - tp_ratio), 8)
-                    )
-                else:
-                    if position_type == "long":
-                        lows = get_recent_lows(symbol, session, interval=interval)
-                        sl_price, scenario_msg, stop_pct = get_long_stop_loss(
-                            lows=lows,
-                            entry_price=executed_price,
-                            tick_size=tick_size,
-                            tick_offset=5,
-                            fallback_pct=0.01,
-                            take_profit_ratio=tp_ratio
-                        )
-                        # 로그: 손절 시나리오 전체 안내문(1차,2차 지지선+손절+익절)
-                        logging.info(f"[손절/익절 시나리오]\n{scenario_msg}")
-                        # 익절가도 안내문에서 사용(자동)
-                        tp_price = round(executed_price * (1 + tp_ratio), 8)
-                    else:
-                        highs = get_recent_highs(symbol, session, interval=interval)
-                        sl_price, scenario_msg, stop_pct = get_short_stop_loss(
-                            highs=highs,
-                            entry_price=executed_price,
-                            tick_size=tick_size,
-                            tick_offset=5,
-                            fallback_pct=0.01,
-                            take_profit_ratio=tp_ratio
-                        )
-                        logging.info(f"[손절/익절 시나리오]\n{scenario_msg}")
-                        tp_price = round(executed_price * (1 - tp_ratio), 8)
-
-                # 익절가(수동 지정시)
-                if take_profit is not None and take_profit != "":
+                # 5) 익절/손절 예약 + 주문ID 저장
+                if take_profit not in [None, ""]:
                     tp_price = float(take_profit)
+                else:
+                    tp_price = round(executed_price * (1 + tp_ratio), 8) if position_type == "long" else round(executed_price * (1 - tp_ratio), 8)
 
-                logging.info(f"[익절/손절 결정] 익절가: {tp_price}, 손절가: {sl_price}")
-
-                # 주문 실행
-                tp_result = place_tp_limit_order(symbol, side, qty, tp_price)
-                sl_result = place_stop_loss(symbol, side, sl_price)
+                tp_result, tp_order_id = place_tp_limit_order(symbol, side, qty, tp_price)
+                sl_result, sl_order_id = place_stop_loss(symbol, side, sl_price)
                 trade_status['info']['tp_order'] = tp_result
                 trade_status['info']['sl_order'] = sl_result
+                trade_status['info']['tp_order_id'] = tp_order_id
+                trade_status['info']['sl_order_id'] = sl_order_id
                 trade_status['info']['tp_price'] = tp_price
                 trade_status['info']['sl_price'] = sl_price
 
                 entry_fired = True
-                logging.info(f"[골든타임봇이 포지션진입, 손절주문, 익절주문 완료했습니다.매매종료까지 감시모드입니다.")
+                logging.info(f"[포지션진입, 익절, 손절주문 등록완료] 진입가: {executed_price}, 수량: {qty}")
                 break
             time.sleep(1)
 
         close_fired = False
         position_closed = False
 
-        while trade_status['running']:
-            now = datetime.now()
+        # ✅ 강제중단 신호 체크 루프 (최상단에서 무조건 우선)
+        while True:
+            # 1) 강제중단 신호 최우선 체크
+            if not trade_status['running']:
+                # 1. 포지션 있으면 시장가로 청산
+                qty = get_position_size(symbol)
+                if qty > 0:
+                    close_side = "Buy" if position_type == "short" else "Sell"
+                    close_position(symbol, close_side, qty)
+                    logging.info("[강제중단] 남은 포지션을 시장가로 강제 청산함.")
+                # 2. 예약 주문 취소
+                tp_order_id = trade_status['info'].get('tp_order_id')
+                sl_order_id = trade_status['info'].get('sl_order_id')
+                cancel_order(symbol, tp_order_id)
+                cancel_order(symbol, sl_order_id)
+                logging.info("[강제중단] 익절/손절 예약주문 자동 취소 완료.")
+                break
 
-            # 청산시간 도달시 시장가로 강제청산 (전량)
+            now = datetime.now()
+            # 2) 종료시간 도달하면 시장가 청산
             if now >= exit_dt and not close_fired:
                 side = "Buy" if position_type == "long" else "Sell"
                 close_order = close_position(symbol, side, qty)
@@ -319,7 +353,6 @@ def trade_worker(
                 close_fired = True
                 break
 
-            # 실시간 포지션 감시 - 포지션이 0이면 종료(익절·손절 등)
             pos_size = get_position_size(symbol)
             if pos_size == 0 and not position_closed:
                 exit_price = get_price(symbol)
