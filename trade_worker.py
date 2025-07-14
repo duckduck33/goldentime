@@ -43,7 +43,7 @@ def trade_worker(
         logging.info("[LOG] 변환된 exit_dt(UTC): %s", exit_dt)
 
         entry_fired = False
-        logging.info("골든타임매매봇 시작합니다.")
+        logging.info("골든타임매매봇 시작합니다111.")
 
         while not entry_fired:
             if not trade_status["running"]:
