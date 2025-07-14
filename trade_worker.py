@@ -265,7 +265,7 @@ def trade_worker(
         }
 
         entry_fired = False
-        logging.info(f"골든타임매매봇 시작합니다0505.")
+        logging.info(f"골든타임매매봇 시작합니다.")
         while not entry_fired:
             if not trade_status["running"]:
                 break
@@ -321,4 +321,77 @@ def trade_worker(
                 if take_profit not in [None, ""]:
                     tp_price = float(take_profit)
                 else:
-                    tp_price = round(executed_price * (1 + t*
+                    tp_price = round(executed_price * (1 + tp_ratio), 8) if position_type == "long" else round(executed_price * (1 - tp_ratio), 8)
+
+                tp_result, tp_order_id = place_tp_limit_order(symbol, side, qty, tp_price)
+                sl_result, sl_order_id = place_stop_loss(symbol, side, sl_price)
+                trade_status['info']['tp_order'] = tp_result
+                trade_status['info']['sl_order'] = sl_result
+                trade_status['info']['tp_order_id'] = tp_order_id
+                trade_status['info']['sl_order_id'] = sl_order_id
+                trade_status['info']['tp_price'] = tp_price
+                trade_status['info']['sl_price'] = sl_price
+
+                entry_fired = True
+                logging.info(f"[포지션진입, 익절, 손절주문 등록완료] 진입가: {executed_price}, 수량: {qty}")
+                break
+
+            else:
+                logging.info(f"[시간로그] 아직 진입 전. (immediate={immediate} and now_utc < entry_dt_utc) 대기 중")
+            time.sleep(1)
+
+        close_fired = False
+        position_closed = False
+
+        while True:
+            if not trade_status['running']:
+                qty = get_position_size(symbol)
+                if qty > 0:
+                    close_side = "Buy" if position_type == "short" else "Sell"
+                    close_position(symbol, close_side, qty)
+                    logging.info("[강제중단] 남은 포지션을 시장가로 강제 청산함.")
+                tp_order_id = trade_status['info'].get('tp_order_id')
+                sl_order_id = trade_status['info'].get('sl_order_id')
+                cancel_order(symbol, tp_order_id)
+                cancel_order(symbol, sl_order_id)
+                logging.info("[강제중단] 익절/손절 예약주문 자동 취소 완료.")
+                break
+
+            now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+            now_kst = now_utc.astimezone(kst)
+            logging.info(f"[시간로그] 종료체크 - now_utc: {now_utc}, exit_dt_utc: {exit_dt_utc}, now_kst: {now_kst}, exit_dt_kst: {exit_dt_kst}")
+
+            if now_utc >= exit_dt_utc and not close_fired:
+                side = "Buy" if position_type == "long" else "Sell"
+                close_order = close_position(symbol, side, qty)
+                trade_status['info']['exit_order'] = close_order
+                trade_status['info']['exit_price'] = get_price(symbol)
+                trade_status['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                logging.info("[포지션 청산] 매도시간 도달하여 포지션을 종료했습니다.")
+                close_fired = True
+                break
+
+            pos_size = get_position_size(symbol)
+            if pos_size == 0 and not position_closed:
+                exit_price = get_price(symbol)
+                trade_status['info']['exit_price'] = exit_price
+                logging.info(f"[체결] 포지션 종료 (체결가: {exit_price})")
+                trade_status['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                position_closed = True
+                break
+
+            time.sleep(2)
+
+    except Exception as e:
+        logging.exception(f"[trade_worker 전체 에러] {e}")
+        trade_status['error'] = str(e)
+    finally:
+        trade_status['running'] = False
+
+def start_trade_thread(**kwargs):
+    if trade_status["running"]:
+        return False, "이미 매매 중입니다."
+    th = threading.Thread(target=trade_worker, kwargs=kwargs)
+    th.daemon = True
+    th.start()
+    return True, "매매 시작됨"
