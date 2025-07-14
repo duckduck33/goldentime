@@ -3,7 +3,7 @@ load_dotenv()
 
 from flask import Flask, request, jsonify
 import trade_worker                       # trade_worker.py 모듈 임포트
-
+import logging
 app = Flask(__name__)
 
 @app.route("/start_trade", methods=["POST"])
@@ -48,11 +48,22 @@ def get_balance():
     coin = request.args.get("coin", "USDT")
     balance = trade_worker.get_balance(coin)
     return jsonify({"coin": coin, "balance": balance})
-
 @app.route("/stop_trade", methods=["POST"])
+
 def stop_trade():
+    logging.info("[LOG] /stop_trade 호출됨")
     trade_worker.trade_status["running"] = False
-    return jsonify({"success": True, "msg": "매매 중단 요청됨."})
+
+    # 🔥 포지션 강제종료 수행
+    try:
+        symbol = trade_worker.trade_status["info"].get("symbol")
+        position_type = trade_worker.trade_status["info"].get("position_type")
+        if symbol and position_type:
+            trade_worker.force_exit_position(symbol, position_type)
+    except Exception as e:
+        logging.error(f"[stop_trade 강제종료 실패] {e}")
+
+    return jsonify({"success": True, "msg": "매매 중단 및 포지션 강제 종료 요청됨."})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

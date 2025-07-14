@@ -265,7 +265,7 @@ def trade_worker(
         }
 
         entry_fired = False
-        logging.info(f"골든타임매매봇 시작합니다.")
+        logging.info(f"골든타임매매봇 시작합니다0542.")
         while not entry_fired:
             if not trade_status["running"]:
                 break
@@ -386,6 +386,9 @@ def trade_worker(
         logging.exception(f"[trade_worker 전체 에러] {e}")
         trade_status['error'] = str(e)
     finally:
+        if trade_status['running']:
+            logging.warning("[finally] 강제중단 flag 감지, 포지션 종료 시도")
+            force_exit_position(symbol, position_type)
         trade_status['running'] = False
 
 def start_trade_thread(**kwargs):
@@ -395,3 +398,25 @@ def start_trade_thread(**kwargs):
     th.daemon = True
     th.start()
     return True, "매매 시작됨"
+
+
+def force_exit_position(symbol, position_type):
+    """
+    매매 강제중단 시 포지션이 존재하면 시장가로 종료 + 예약 주문 취소
+    """
+    try:
+        qty = get_position_size(symbol)
+        if qty > 0:
+            close_side = "Buy" if position_type == "short" else "Sell"
+            close_position(symbol, close_side, qty)
+            logging.info("[강제종료] 남은 포지션 시장가로 청산 완료.")
+        else:
+            logging.info("[강제종료] 청산할 포지션이 없습니다.")
+
+        tp_order_id = trade_status['info'].get('tp_order_id')
+        sl_order_id = trade_status['info'].get('sl_order_id')
+        cancel_order(symbol, tp_order_id)
+        cancel_order(symbol, sl_order_id)
+        logging.info("[강제종료] 익절/손절 예약주문 자동 취소 완료.")
+    except Exception as e:
+        logging.error(f"[강제종료 오류] {e}")
