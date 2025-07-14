@@ -8,6 +8,17 @@ app = Flask(__name__)
 
 trade_status = {"running": False, "info": {}, "error": None}
 
+# ────────
+# 서버 실행시 현재 시간 체크 (UTC, KST 모두)
+# ────────
+kst = pytz.timezone('Asia/Seoul')
+now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+now_kst = datetime.now(kst)
+print("=== [서버 시작:07150403 배포체크용] ===")
+print("서버 현재 UTC 시간:", now_utc)
+print("서버 현재 KST 시간:", now_kst)
+print("==================")
+
 def trade_worker(entry_time_kst, symbol, position_type, immediate):
     kst = pytz.timezone('Asia/Seoul')
 
@@ -23,10 +34,12 @@ def trade_worker(entry_time_kst, symbol, position_type, immediate):
     # 2. KST datetime → UTC로 변환
     entry_dt = dt_kst.astimezone(pytz.utc)
 
+    print("\n[LOG] 매매 예약 시작")
     print("[LOG] entry_time 파라미터(KST):", entry_time_kst)
     print("[LOG] 파싱된 KST datetime:", dt_kst)
     print("[LOG] 변환된 entry_dt (UTC):", entry_dt)
     print("[LOG] immediate 값:", immediate)
+    print("===============================")
 
     trade_status["running"] = True
     trade_status["info"] = {
@@ -41,21 +54,25 @@ def trade_worker(entry_time_kst, symbol, position_type, immediate):
     entry_fired = False
     while not entry_fired:
         if not trade_status["running"]:
+            print("[LOG] 매매 중단 신호 감지! 스레드 종료")
             break
 
         now = datetime.utcnow().replace(tzinfo=pytz.utc)
         print("[LOG] 현재 서버 시간(now, UTC):", now)
+        print("[LOG] 예약 진입 시간(entry_dt, UTC):", entry_dt)
 
         if immediate or now >= entry_dt:
             print("[LOG] 진입 조건 만족! 매매 진입 (now >= entry_dt or immediate=True)")
             trade_status["info"]["entry_at"] = now.strftime("%Y-%m-%d %H:%M")
             entry_fired = True
             break
+        else:
+            print("[LOG] 아직 진입 시간 아님! 대기 중 (now < entry_dt)")
 
-        time.sleep(2)
+        time.sleep(5)
 
     trade_status["running"] = False
-    print("[LOG] 매매 스레드 종료")
+    print("[LOG] 매매 스레드 종료\n")
 
 def start_trade_thread(**kwargs):
     if trade_status["running"]:
