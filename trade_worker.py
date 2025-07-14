@@ -1,5 +1,3 @@
-# trade_worker.py (interval "30"으로만 수정, 나머지는 원본 그대로!)
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,6 +6,7 @@ import time
 import math
 import logging
 from datetime import datetime
+import pytz
 from pybit.unified_trading import HTTP
 import threading
 
@@ -28,7 +27,7 @@ BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
 
 session = HTTP(
     testnet=False,
-    api_key=BYBIT_API_KEY,   # 실제 API 키 문자열
+    api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET
 )
 
@@ -119,7 +118,6 @@ def adjust_qty_by_lot_size(symbol, qty):
     adjusted_qty = math.floor(qty / step) * step
     return round(adjusted_qty, 8)
 
-# ✅ 여기가 30분봉 5캔들로 바뀐 부분!
 def get_recent_lows(symbol, session, interval="30"):
     try:
         res = session.get_kline(
@@ -225,47 +223,68 @@ def trade_worker(
     고정손실액 입력 -> 자동 진입수량 계산(최소수량/틱 자동 보정) -> 주문/감시
     강제중단 시 포지션 청산 + 예약주문 취소까지 포함
     """
-    trade_status['running'] = True
-    trade_status['info'] = {
-        "position_type": position_type,
-        "symbol": symbol,
-        "fixed_loss": fixed_loss,
-        "entry_time": entry_time,
-        "exit_time": exit_time,
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "entry_price": None,
-        "exit_price": None,
-        "entry_order": None,
-        "tp_order": None,
-        "sl_order": None,
-        "tp_order_id": None,
-        "sl_order_id": None,
-        "tp_price": None,
-        "sl_price": None,
-        "stop_loss_msg": None,
-        "exit_at": None,
-        "immediate": immediate
-    }
+
+    # ----------- 시간 파싱/변환/비교 구간 로그 강화! -----------
+    kst = pytz.timezone("Asia/Seoul")
     try:
-        entry_dt = datetime.strptime(entry_time, "%Y-%m-%d %H:%M")
-        exit_dt = datetime.strptime(exit_time, "%Y-%m-%d %H:%M")
+        logging.info(f"[시간로그] 입력받은 entry_time: {entry_time}")
+        logging.info(f"[시간로그] 입력받은 exit_time: {exit_time}")
+        logging.info(f"[시간로그] 즉시매매(immediate): {immediate}")
+
+        entry_dt_kst = kst.localize(datetime.strptime(entry_time, "%Y-%m-%d %H:%M"))
+        exit_dt_kst = kst.localize(datetime.strptime(exit_time, "%Y-%m-%d %H:%M"))
+        logging.info(f"[시간로그] entry_time(KST): {entry_dt_kst}")
+        logging.info(f"[시간로그] exit_time(KST): {exit_dt_kst}")
+
+        entry_dt_utc = entry_dt_kst.astimezone(pytz.utc)
+        exit_dt_utc = exit_dt_kst.astimezone(pytz.utc)
+        logging.info(f"[시간로그] entry_time(UTC): {entry_dt_utc}")
+        logging.info(f"[시간로그] exit_time(UTC): {exit_dt_utc}")
+
+        trade_status['running'] = True
+        trade_status['info'] = {
+            "position_type": position_type,
+            "symbol": symbol,
+            "fixed_loss": fixed_loss,
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "entry_price": None,
+            "exit_price": None,
+            "entry_order": None,
+            "tp_order": None,
+            "sl_order": None,
+            "tp_order_id": None,
+            "sl_order_id": None,
+            "tp_price": None,
+            "sl_price": None,
+            "stop_loss_msg": None,
+            "exit_at": None,
+            "immediate": immediate
+        }
+
         entry_fired = False
-        logging.info(f"골든타임매매봇 시작합니다.")
+        logging.info(f"골든타임매매봇 시작합니다0505.")
         while not entry_fired:
             if not trade_status["running"]:
                 break
-            now = datetime.now()
-            if immediate or now >= entry_dt:
+
+            now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+            now_kst = now_utc.astimezone(kst)
+            logging.info(f"[시간로그] 현재 서버시간(now, UTC): {now_utc}")
+            logging.info(f"[시간로그] 현재 서버시간(now, KST): {now_kst}")
+            logging.info(f"[시간로그] 예약 진입시간(entry_dt_UTC): {entry_dt_utc}")
+
+            if immediate or now_utc >= entry_dt_utc:
+                logging.info(f"[시간로그] 진입 조건 만족! (immediate={immediate} or now_utc >= entry_dt_utc)")
                 side = "Buy" if position_type == "long" else "Sell"
 
-                # 1) 진입가(현재가) 조회
                 executed_price = get_price(symbol)
-
-                # 2) 손절가 자동계산
                 tick_size = get_tick_size(symbol)
-                interval = "30"   # ✅ 여기만 30분봉으로!
+                interval = "30"
                 tp_ratio = 0.02
+
                 if position_type == "long":
                     lows = get_recent_lows(symbol, session, interval=interval)
                     sl_price, scenario_msg, stop_pct = get_long_stop_loss(
@@ -289,92 +308,17 @@ def trade_worker(
                     )
                     logging.info(f"[손절/익절 시나리오]\n{scenario_msg}")
 
-                # 3) 고정손실액으로 권장 진입수량 계산 & minQty/틱 자동보정
                 loss_amount = float(fixed_loss)
                 raw_qty = loss_amount / abs(executed_price - sl_price)
                 qty = adjust_qty_by_lot_size(symbol, raw_qty)
                 logging.info(f"[고정손실] {loss_amount}$, 진입가:{executed_price}, 손절가:{sl_price} → 권장수량(보정): {qty}")
 
-                # 4) 시장가 진입
                 entry_order = open_position(symbol, side, qty)
                 trade_status['info']['entry_order'] = entry_order
-                trade_status['info']['entry_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
+                trade_status['info']['entry_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
                 trade_status['info']['entry_price'] = executed_price
 
-                # 5) 익절/손절 예약 + 주문ID 저장
                 if take_profit not in [None, ""]:
                     tp_price = float(take_profit)
                 else:
-                    tp_price = round(executed_price * (1 + tp_ratio), 8) if position_type == "long" else round(executed_price * (1 - tp_ratio), 8)
-
-                tp_result, tp_order_id = place_tp_limit_order(symbol, side, qty, tp_price)
-                sl_result, sl_order_id = place_stop_loss(symbol, side, sl_price)
-                trade_status['info']['tp_order'] = tp_result
-                trade_status['info']['sl_order'] = sl_result
-                trade_status['info']['tp_order_id'] = tp_order_id
-                trade_status['info']['sl_order_id'] = sl_order_id
-                trade_status['info']['tp_price'] = tp_price
-                trade_status['info']['sl_price'] = sl_price
-
-                entry_fired = True
-                logging.info(f"[포지션진입, 익절, 손절주문 등록완료] 진입가: {executed_price}, 수량: {qty}")
-                break
-            time.sleep(1)
-
-        close_fired = False
-        position_closed = False
-
-        # ✅ 강제중단 신호 체크 루프 (최상단에서 무조건 우선)
-        while True:
-            # 1) 강제중단 신호 최우선 체크
-            if not trade_status['running']:
-                # 1. 포지션 있으면 시장가로 청산
-                qty = get_position_size(symbol)
-                if qty > 0:
-                    close_side = "Buy" if position_type == "short" else "Sell"
-                    close_position(symbol, close_side, qty)
-                    logging.info("[강제중단] 남은 포지션을 시장가로 강제 청산함.")
-                # 2. 예약 주문 취소
-                tp_order_id = trade_status['info'].get('tp_order_id')
-                sl_order_id = trade_status['info'].get('sl_order_id')
-                cancel_order(symbol, tp_order_id)
-                cancel_order(symbol, sl_order_id)
-                logging.info("[강제중단] 익절/손절 예약주문 자동 취소 완료.")
-                break
-
-            now = datetime.now()
-            # 2) 종료시간 도달하면 시장가 청산
-            if now >= exit_dt and not close_fired:
-                side = "Buy" if position_type == "long" else "Sell"
-                close_order = close_position(symbol, side, qty)
-                trade_status['info']['exit_order'] = close_order
-                trade_status['info']['exit_price'] = get_price(symbol)
-                trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                logging.info("[포지션 청산] 매도시간 도달하여 포지션을 종료했습니다.")
-                close_fired = True
-                break
-
-            pos_size = get_position_size(symbol)
-            if pos_size == 0 and not position_closed:
-                exit_price = get_price(symbol)
-                trade_status['info']['exit_price'] = exit_price
-                logging.info(f"[체결] 포지션 종료 (체결가: {exit_price})")
-                trade_status['info']['exit_at'] = now.strftime("%Y-%m-%d %H:%M:%S")
-                position_closed = True
-                break
-
-            time.sleep(2)
-
-    except Exception as e:
-        logging.exception(f"[trade_worker 전체 에러] {e}")
-        trade_status['error'] = str(e)
-    finally:
-        trade_status['running'] = False
-
-def start_trade_thread(**kwargs):
-    if trade_status["running"]:
-        return False, "이미 매매 중입니다."
-    th = threading.Thread(target=trade_worker, kwargs=kwargs)
-    th.daemon = True
-    th.start()
-    return True, "매매 시작됨"
+                    tp_price = round(executed_price * (1 + t*
