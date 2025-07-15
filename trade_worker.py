@@ -19,14 +19,10 @@ logging.basicConfig(
     ]
 )
 
-# 전역 trade_status는 완전히 제거!
+# === 공통 pybit 유틸리티 함수들 ===
 
 def get_balance(api_key, api_secret, coin: str = "USDT"):
-    session = HTTP(
-        testnet=False,
-        api_key=api_key,
-        api_secret=api_secret
-    )
+    session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
     try:
         res = session.get_wallet_balance(accountType="UNIFIED", coin=coin)
         return res['result']['list'][0]['totalEquity']
@@ -203,7 +199,30 @@ def cancel_order(session, symbol, order_id):
     except Exception as e:
         logging.error(f"[주문취소 에러] {e}")
 
-# === trade_worker 쓰레드: 반드시 user_id, trade_statuses 전달 ===
+# === 강제 청산/주문취소 ===
+def force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses):
+    """
+    - 포지션 시장가 강제 청산
+    - TP/SL 예약주문 모두 취소
+    """
+    try:
+        session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
+        qty = get_position_size(session, symbol)
+        if qty > 0:
+            close_side = "Buy" if position_type == "short" else "Sell"
+            close_position(session, symbol, close_side, qty)
+
+        # TP/SL 예약주문 자동 취소
+        tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
+        sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
+        cancel_order(session, symbol, tp_order_id)
+        cancel_order(session, symbol, sl_order_id)
+        logging.info(f"[강제종료] TP/SL 예약주문 자동취소 (user_id={user_id})")
+
+    except Exception as e:
+        logging.error(f"[강제종료 오류] {e}")
+
+# === 실제 매매 쓰레드 ===
 def trade_worker(
     user_id, trade_statuses,
     api_key, api_secret,
@@ -214,12 +233,7 @@ def trade_worker(
     """
     사용자별 trade_statuses[user_id]에만 상태 기록/조회
     """
-    session = HTTP(
-        testnet=False,
-        api_key=api_key,
-        api_secret=api_secret
-    )
-
+    session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
     kst = pytz.timezone("Asia/Seoul")
     try:
         # 유저별 상태 딕셔너리 생성/초기화
@@ -250,7 +264,6 @@ def trade_worker(
         }
 
         entry_fired = False
-        logging.info(f"골든타임매매봇 시작합니다(user_id={user_id}).")
         entry_dt_kst = kst.localize(datetime.strptime(entry_time, "%Y-%m-%d %H:%M"))
         exit_dt_kst = kst.localize(datetime.strptime(exit_time, "%Y-%m-%d %H:%M"))
         entry_dt_utc = entry_dt_kst.astimezone(pytz.utc)
@@ -261,11 +274,9 @@ def trade_worker(
                 break
 
             now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
-            now_kst = now_utc.astimezone(kst)
 
             if immediate or now_utc >= entry_dt_utc:
                 side = "Buy" if position_type == "long" else "Sell"
-
                 executed_price = get_price(session, symbol)
                 tick_size = get_tick_size(session, symbol)
                 interval = "30"
@@ -298,7 +309,7 @@ def trade_worker(
 
                 entry_order = open_position(session, symbol, side, qty)
                 trade_statuses[user_id]['info']['entry_order'] = entry_order
-                trade_statuses[user_id]['info']['entry_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                trade_statuses[user_id]['info']['entry_at'] = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
                 trade_statuses[user_id]['info']['entry_price'] = executed_price
 
                 if take_profit not in [None, ""]:
@@ -324,29 +335,32 @@ def trade_worker(
         position_closed = False
 
         while True:
+            # 1) 매매 중단 요청(강제종료) 시 모든 포지션/주문 일괄 종료
             if not trade_statuses[user_id]['running']:
-                qty = get_position_size(session, symbol)
-                if qty > 0:
-                    close_side = "Buy" if position_type == "short" else "Sell"
-                    close_position(session, symbol, close_side, qty)
-                tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
-                sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
-                cancel_order(session, symbol, tp_order_id)
-                cancel_order(session, symbol, sl_order_id)
+                force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
                 break
 
             now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
             now_kst = now_utc.astimezone(kst)
 
+            # 2) 지정 종료시간 도달 시 자동 종료
             if now_utc >= exit_dt_utc and not close_fired:
                 side = "Buy" if position_type == "long" else "Sell"
-                close_order = close_position(session, symbol, side, qty)
-                trade_statuses[user_id]['info']['exit_order'] = close_order
-                trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
-                trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                qty = get_position_size(session, symbol)
+                if qty > 0:
+                    close_order = close_position(session, symbol, side, qty)
+                    trade_statuses[user_id]['info']['exit_order'] = close_order
+                    trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
+                    trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                # TP/SL 예약주문 취소도 반드시
+                tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
+                sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
+                cancel_order(session, symbol, tp_order_id)
+                cancel_order(session, symbol, sl_order_id)
                 close_fired = True
                 break
 
+            # 3) 포지션이 사라지면(청산됨) 기록 후 종료
             pos_size = get_position_size(session, symbol)
             if pos_size == 0 and not position_closed:
                 exit_price = get_price(session, symbol)
@@ -361,8 +375,9 @@ def trade_worker(
         logging.exception(f"[trade_worker 전체 에러] {e}")
         trade_statuses[user_id]['error'] = str(e)
     finally:
+        # 남아있는 포지션/주문 강제종료(꼬임 방지)
         if trade_statuses[user_id]['running']:
-            force_exit_position(symbol, position_type, api_key, api_secret)
+            force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
         trade_statuses[user_id]['running'] = False
 
 # === 스레드 실행 함수: user_id, trade_statuses 필수 ===
@@ -375,30 +390,3 @@ def start_trade_thread(**kwargs):
     th.daemon = True
     th.start()
     return True, "매매 시작됨"
-
-# === 강제 청산 ===
-def force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses):
-    """
-    - 포지션 시장가 강제 청산
-    - TP/SL 예약주문도 모두 취소
-    """
-    try:
-        session = HTTP(
-            testnet=False,
-            api_key=api_key,
-            api_secret=api_secret
-        )
-        qty = get_position_size(session, symbol)
-        if qty > 0:
-            close_side = "Buy" if position_type == "short" else "Sell"
-            close_position(session, symbol, close_side, qty)
-
-        # --- TP/SL 예약주문 취소 ---
-        tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
-        sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
-        cancel_order(session, symbol, tp_order_id)
-        cancel_order(session, symbol, sl_order_id)
-        logging.info(f"[강제종료] TP/SL 예약주문 자동취소 (user_id={user_id})")
-
-    except Exception as e:
-        logging.error(f"[강제종료 오류] {e}")

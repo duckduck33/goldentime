@@ -101,7 +101,7 @@ def stop_trade():
             symbol = trade_statuses[user_id]["info"].get("symbol")
             position_type = trade_statuses[user_id]["info"].get("position_type")
             if symbol and position_type and api_key and api_secret:
-                trade_worker.force_exit_position(symbol, position_type, api_key, api_secret)
+                trade_worker.force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
         except Exception as e:
             logging.error(f"[stop_trade 강제종료 실패] {e}")
 
