@@ -207,17 +207,20 @@ def force_exit_position(user_id, symbol, position_type, api_key, api_secret, tra
     """
     try:
         session = HTTP(testnet=False, api_key=api_key, api_secret=api_secret)
+        side = "Buy" if position_type == "long" else "Sell"
         qty = get_position_size(session, symbol)
-        if qty > 0:
-            close_side = "Buy" if position_type == "short" else "Sell"
-            close_position(session, symbol, close_side, qty)
 
-        # TP/SL 예약주문 자동 취소
+        if qty > 0:
+            close_order = close_position(session, symbol, side, qty)
+            # trade_statuses[user_id]['info']['exit_order'] = close_order
+            # trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
+            # trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+        # TP/SL 예약주문 취소도 반드시
         tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
         sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
         cancel_order(session, symbol, tp_order_id)
         cancel_order(session, symbol, sl_order_id)
-        logging.info(f"[강제종료] TP/SL 예약주문 자동취소 (user_id={user_id})")
+        close_fired = True
 
     except Exception as e:
         logging.error(f"[강제종료 오류] {e}")
@@ -338,26 +341,42 @@ def trade_worker(
             # 1) 매매 중단 요청(강제종료) 시 모든 포지션/주문 일괄 종료
             if not trade_statuses[user_id]['running']:
                 force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
-                break
 
+                # side = "Buy" if position_type == "long" else "Sell"
+                # qty = get_position_size(session, symbol)
+                # if qty > 0:
+                #     close_order = close_position(session, symbol, side, qty)
+                #     trade_statuses[user_id]['info']['exit_order'] = close_order
+                #     trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
+                #     trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                # # TP/SL 예약주문 취소도 반드시
+                # tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
+                # sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
+                # cancel_order(session, symbol, tp_order_id)
+                # cancel_order(session, symbol, sl_order_id)
+                # close_fired = True
+                break
+            
             now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
             now_kst = now_utc.astimezone(kst)
 
             # 2) 지정 종료시간 도달 시 자동 종료
             if now_utc >= exit_dt_utc and not close_fired:
-                side = "Buy" if position_type == "long" else "Sell"
-                qty = get_position_size(session, symbol)
-                if qty > 0:
-                    close_order = close_position(session, symbol, side, qty)
-                    trade_statuses[user_id]['info']['exit_order'] = close_order
-                    trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
-                    trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
-                # TP/SL 예약주문 취소도 반드시
-                tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
-                sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
-                cancel_order(session, symbol, tp_order_id)
-                cancel_order(session, symbol, sl_order_id)
-                close_fired = True
+                force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
+
+                # side = "Buy" if position_type == "long" else "Sell"
+                # qty = get_position_size(session, symbol)
+                # if qty > 0:
+                #     close_order = close_position(session, symbol, side, qty)
+                #     trade_statuses[user_id]['info']['exit_order'] = close_order
+                #     trade_statuses[user_id]['info']['exit_price'] = get_price(session, symbol)
+                #     trade_statuses[user_id]['info']['exit_at'] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+                # # TP/SL 예약주문 취소도 반드시
+                # tp_order_id = trade_statuses[user_id]['info'].get('tp_order_id')
+                # sl_order_id = trade_statuses[user_id]['info'].get('sl_order_id')
+                # cancel_order(session, symbol, tp_order_id)
+                # cancel_order(session, symbol, sl_order_id)
+                # close_fired = True
                 break
 
             # 3) 포지션이 사라지면(청산됨) 기록 후 종료
