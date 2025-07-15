@@ -1,4 +1,4 @@
-/project_root
+/project_root   : 개인키매몰방식
 │
 ├── trade_worker.py         # 1단계: 자동매매(TradeWorker) 쓰레드 및 매매 로직
 ├── api_server.py           # 1단계: Flask API 서버 및 라우팅 구현
