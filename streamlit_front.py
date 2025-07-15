@@ -1,25 +1,33 @@
 import streamlit as st
 import requests
 from datetime import datetime
+import uuid
 
 # ================================
-# 1. API 서버 주소 변수 (Railway 배포주소로 변경 필수!)
+# 1. API 서버 주소
 # ================================
-API_BASE_URL = "https://goldentime-production.up.railway.app"  # ← 반드시 본인 Railway 백엔드 주소로 변경
+API_BASE_URL = "https://goldentime-production.up.railway.app"
 
 # ================================
-# 2. 상단 로고/앱 소개 (원할 경우 활성화)
+# 2. user_id(고유식별자) 생성 및 세션에 저장
 # ================================
-# col1, col2 = st.columns([1, 8])
-# with col1:
-#     st.image("logo.png", width=56)
-# with col2:
-#     st.markdown("<h2 style='color:#FFD600;margin-bottom:0;'>골든타임 매매 플랫폼</h2>", unsafe_allow_html=True)
-#     st.caption("AI 자동매매, 다양한 퀀트 전략을 한곳에서 - 초보도 쉽게, 전문가도 강력하게")
-# st.write("---")
+if "user_id" not in st.session_state:
+    # 최초 접속 시 UUID 생성, 세션에 저장
+    st.session_state["user_id"] = str(uuid.uuid4())
+user_id = st.session_state["user_id"]
 
 # ================================
-# 3. 탭 메뉴 정의
+# 3. BYBIT API 키/시크릿 입력 UI
+# ================================
+with st.sidebar:
+    st.subheader("Bybit API 키 입력")
+    api_key = st.text_input("BYBIT API KEY", value=st.session_state.get("api_key", ""), key="api_key")
+    api_secret = st.text_input("BYBIT API SECRET", value=st.session_state.get("api_secret", ""), key="api_secret", type="password")
+    if not api_key or not api_secret:
+        st.warning("API 키와 시크릿을 모두 입력해야 매매 기능 사용 가능!")
+
+# ================================
+# 4. 탭 메뉴 정의
 # ================================
 tab_list = [
     "골든타임매매봇",
@@ -31,11 +39,11 @@ tab_list = [
 tabs = st.tabs(tab_list)
 
 # ================================
-# 4. 골든타임 자동매매봇 탭 (메인)
+# 5. 골든타임 자동매매봇 탭 (메인)
 # ================================
 with tabs[0]:
     st.subheader("골든타임 자동매매봇")
-    st.info("※ 변동성 돌파, 타임메타 등 다양한 전략을 테스트넷 환경에서 실전처럼 체험하세요.")
+    st.info("※ BYBIT API KEY/SECRET 미입력시 매매 기능을 쓸 수 없습니다.")
 
     symbol = st.text_input("거래 코인(심볼)", value="BTCUSDT")
     position_type = st.radio("포지션", ["long", "short"], horizontal=True)
@@ -50,50 +58,83 @@ with tabs[0]:
 
     # ----- 매매 시작 버튼 -----
     if st.button("매매 시작"):
-        req_data = {
-            "position_type": position_type,
-            "symbol": symbol,
-            "fixed_loss": fixed_loss,  # qty 대신 fixed_loss만 전송
-            "entry_time": entry_time_raw,
-            "exit_time": exit_time_raw,
-            "take_profit": float(take_profit) if take_profit else None,
-            "stop_loss": float(stop_loss) if stop_loss else None,
-            "immediate": immediate
-        }
-        try:
-            # API 서버에 POST 요청 (배포 주소로 반드시 변경)
-            _ = requests.post(f"{API_BASE_URL}/start_trade", json=req_data)
-            st.success("골든타임매매봇 동작합니다")
-        except Exception as e:
-            st.error(f"서버 연결 오류!\n{e}")
+        if not api_key or not api_secret:
+            st.error("API 키와 시크릿을 모두 입력하세요.")
+        else:
+            req_data = {
+                "user_id": user_id,             # ← user_id 항상 포함
+                "position_type": position_type,
+                "symbol": symbol,
+                "fixed_loss": fixed_loss,
+                "entry_time": entry_time_raw,
+                "exit_time": exit_time_raw,
+                "take_profit": float(take_profit) if take_profit else None,
+                "stop_loss": float(stop_loss) if stop_loss else None,
+                "immediate": immediate,
+                "api_key": api_key,
+                "api_secret": api_secret
+            }
+            try:
+                res = requests.post(f"{API_BASE_URL}/start_trade", json=req_data)
+                if res.ok and res.json().get("success"):
+                    st.success("골든타임매매봇 동작 시작!")
+                else:
+                    st.error(f"매매 시작 실패: {res.json().get('msg')}")
+            except Exception as e:
+                st.error(f"서버 연결 오류!\n{e}")
 
     # ----- 매매 상태 확인 버튼 -----
     if st.button("매매 상태 확인"):
-        try:
-            res = requests.get(f"{API_BASE_URL}/trade_status").json()
-            running = res.get("running")
-            st.info("매매 진행중" if running else "대기중")
-        except Exception as e:
-            st.error(f"서버 연결 오류!\n{e}")
+        if not api_key or not api_secret:
+            st.error("API 키와 시크릿을 모두 입력하세요.")
+        else:
+            try:
+                params = {
+                    "user_id": user_id,         # ← user_id 항상 포함
+                    "api_key": api_key,
+                    "api_secret": api_secret
+                }
+                res = requests.get(f"{API_BASE_URL}/trade_status", params=params).json()
+                running = res.get("running")
+                st.info("매매 진행중" if running else "대기중")
+            except Exception as e:
+                st.error(f"서버 연결 오류!\n{e}")
 
     # ----- 매매 강제 중단 버튼 -----
     if st.button("매매 강제 중단"):
-        try:
-            _ = requests.post(f"{API_BASE_URL}/stop_trade")
-            st.warning("골든타임매매봇이 중단됩니다")
-        except Exception as e:
-            st.error(f"서버 연결 오류!\n{e}")
+        if not api_key or not api_secret:
+            st.error("API 키와 시크릿을 모두 입력하세요.")
+        else:
+            try:
+                req_data = {
+                    "user_id": user_id,         # ← user_id 항상 포함
+                    "api_key": api_key,
+                    "api_secret": api_secret
+                }
+                _ = requests.post(f"{API_BASE_URL}/stop_trade", json=req_data)
+                st.warning("골든타임매매봇이 중단됩니다")
+            except Exception as e:
+                st.error(f"서버 연결 오류!\n{e}")
 
     # ----- 잔고 확인 -----
     if st.checkbox("잔고 확인"):
-        try:
-            res = requests.get(f"{API_BASE_URL}/get_balance").json()
-            st.write(f"코인: {res.get('coin')} / 잔고: {res.get('balance')}")
-        except Exception as e:
-            st.error(f"서버 연결 오류!\n{e}")
+        if not api_key or not api_secret:
+            st.error("API 키와 시크릿을 모두 입력하세요.")
+        else:
+            try:
+                params = {
+                    "user_id": user_id,         # ← user_id 항상 포함
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "coin": "USDT"
+                }
+                res = requests.get(f"{API_BASE_URL}/get_balance", params=params).json()
+                st.write(f"코인: {res.get('coin')} / 잔고: {res.get('balance')}")
+            except Exception as e:
+                st.error(f"서버 연결 오류!\n{e}")
 
 # ================================
-# 5. 나머지 탭(준비중/안내)
+# 6. 나머지 탭(준비중/안내)
 # ================================
 with tabs[1]:
     st.subheader("거래소 공지사항 자동매매봇")
