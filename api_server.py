@@ -97,13 +97,13 @@ def stop_trade():
     if user_id in trade_statuses:
         trade_statuses[user_id]["running"] = False
 
-        try:
-            symbol = trade_statuses[user_id]["info"].get("symbol")
-            position_type = trade_statuses[user_id]["info"].get("position_type")
-            if symbol and position_type and api_key and api_secret:
-                trade_worker.force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
-        except Exception as e:
-            logging.error(f"[stop_trade 강제종료 실패] {e}")
+        # try:
+        #     symbol = trade_statuses[user_id]["info"].get("symbol")
+        #     position_type = trade_statuses[user_id]["info"].get("position_type")
+        #     if symbol and position_type and api_key and api_secret:
+        #         trade_worker.force_exit_position(user_id, symbol, position_type, api_key, api_secret, trade_statuses)
+        # except Exception as e:
+        #     logging.error(f"[stop_trade 강제종료 실패] {e}")
 
     return jsonify({"success": True, "msg": "매매 중단 및 포지션 강제 종료 요청됨."})
 
